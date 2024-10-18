@@ -1,0 +1,4 @@
+requests
+PySide6
+urllib3
+certifi
