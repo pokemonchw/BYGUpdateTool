@@ -150,6 +150,115 @@ class Updater(QThread):
             self.error_occurred.emit(error_message)
             self.finished.emit(False)
 
+class APIUpdateChecker(QThread):
+    """ API 更新检查器 """
+    releases_fetched = Signal(list)
+    error_occurred = Signal(str)
+
+    def __init__(self, session, api_base_url):
+        """
+        初始化 APIUpdateChecker 线程
+        Keyword arguments:
+        session -- requests.Session 对象，用于发送网络请求
+        api_base_url -- API 基础 URL
+        """
+        super().__init__()
+        self.session = session
+        self.api_base_url = api_base_url
+
+    def run(self):
+        """ 线程运行函数，获取 API 的所有发布版本信息 """
+        try:
+            response = self.session.get(f"{self.api_base_url}/api/v1/version/getHistory")
+            response.raise_for_status()
+            data = response.json()
+            if data.get('success'):
+                releases = data.get('result', [])
+                self.releases_fetched.emit(releases)
+            else:
+                error_message = data.get('message', '未知错误')
+                print(error_message)
+                self.error_occurred.emit(error_message)
+        except requests.RequestException as e:
+            error_message = f"获取更新信息时出错: {e}"
+            print(error_message)
+            self.error_occurred.emit(error_message)
+
+class APIUpdater(QThread):
+    """ API 更新下载器 """
+    progress = Signal(int)
+    finished = Signal(bool)
+    error_occurred = Signal(str)
+
+    def __init__(self, session, download_url, extract_path, asset_name):
+        """
+        初始化 APIUpdater 线程
+        Keyword arguments:
+        session -- requests.Session 对象，用于发送网络请求
+        download_url -- 要下载的文件的 URL
+        extract_path -- 文件解压的目标路径
+        asset_name -- 资产文件名
+        """
+        super().__init__()
+        self.session = session
+        self.download_url = download_url
+        self.extract_path = extract_path
+        self.asset_name = asset_name
+
+    def run(self):
+        """ 线程运行函数，下载并解压指定的资产文件 """
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0',
+                'Accept': '*/*'
+            }
+            response = self.session.get(
+                self.download_url, stream=True, timeout=60, headers=headers
+            )
+            response.raise_for_status()
+            content_type = response.headers.get('Content-Type', '')
+            if 'application/zip' not in content_type and 'application/octet-stream' not in content_type:
+                error_message = f"下载的文件不是 ZIP 文件，Content-Type: {content_type}"
+                print(error_message)
+                self.error_occurred.emit(error_message)
+                self.finished.emit(False)
+                return
+            total_length = int(response.headers.get("content-length", 0))
+            download_path = os.path.join(tempfile.gettempdir(), self.asset_name)
+            with open(download_path, "wb") as file:
+                downloaded = 0
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        file.write(chunk)
+                        downloaded += len(chunk)
+                        if total_length > 0:
+                            self.progress.emit(int((downloaded / total_length) * 100))
+                        else:
+                            self.progress.emit(0)
+            if not zipfile.is_zipfile(download_path):
+                error_message = "下载的文件不是有效的 ZIP 文件"
+                print(error_message)
+                self.error_occurred.emit(error_message)
+                self.finished.emit(False)
+                return
+            import re
+            asset_name_without_ext = os.path.splitext(self.asset_name)[0]
+            safe_folder_name = re.sub(r'[\\/:"*?<>|]+', "_", asset_name_without_ext)
+            folder_path = os.path.join(self.extract_path, safe_folder_name)
+            if not os.path.exists(folder_path):
+                os.makedirs(folder_path)
+            else:
+                shutil.rmtree(folder_path)
+                os.makedirs(folder_path)
+            with zipfile.ZipFile(download_path, 'r') as zip_ref:
+                zip_ref.extractall(folder_path)
+            self.finished.emit(True)
+        except requests.RequestException as e:
+            error_message = f"下载更新时出错: {e}"
+            print(error_message)
+            self.error_occurred.emit(error_message)
+            self.finished.emit(False)
+
 class UpdaterUI(QWidget):
     """ 主界面 """
 
@@ -175,6 +284,9 @@ class UpdaterUI(QWidget):
             repo_address = repo_info.get("repo", "")
             tab = self.create_repo_tab(repo_name, repo_address)
             self.tab_widget.addTab(tab, repo_name)
+        # 创建API下载的标签页
+        self.api_tab = self.create_api_tab()
+        self.tab_widget.addTab(self.api_tab, "dieloli")
         self.game_list = QListWidget()
         self.game_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.game_list.customContextMenuRequested.connect(self.show_context_menu)
@@ -247,11 +359,51 @@ class UpdaterUI(QWidget):
         tab.setLayout(tab_layout)
         return tab
 
+    def create_api_tab(self):
+        """
+        创建API更新的标签页
+        Return arguments:
+        QWidget -- 包含API更新信息和操作控件的标签页小部件
+        """
+        tab = QWidget()
+        tab_layout = QVBoxLayout()
+        check_update_button = QPushButton("检查更新")
+        check_update_button.clicked.connect(lambda: self.api_check_for_updates(tab))
+        tab_layout.addWidget(check_update_button)
+        version_selector = QComboBox()
+        version_selector.setVisible(False)
+        tab_layout.addWidget(version_selector)
+        asset_selector = QComboBox()
+        asset_selector.setVisible(False)
+        tab_layout.addWidget(asset_selector)
+        release_notes = QTextEdit()
+        release_notes.setReadOnly(True)
+        release_notes.setVisible(False)
+        tab_layout.addWidget(release_notes)
+        download_button = QPushButton("下载并更新")
+        download_button.setVisible(False)
+        tab_layout.addWidget(download_button)
+        progress_bar = QProgressBar()
+        progress_bar.setValue(0)
+        progress_bar.setVisible(False)
+        tab_layout.addWidget(progress_bar)
+        tab.check_update_button = check_update_button
+        tab.version_selector = version_selector
+        tab.asset_selector = asset_selector
+        tab.release_notes = release_notes
+        tab.download_button = download_button
+        tab.progress_bar = progress_bar
+        tab.setLayout(tab_layout)
+        return tab
+
     def populate_game_list(self):
         """ 填充游戏列表，显示当前仓库下已下载的游戏版本 """
         self.game_list.clear()
         current_tab = self.tab_widget.currentWidget()
-        repo_name = current_tab.repo_name
+        if hasattr(current_tab, 'repo_name'):
+            repo_name = current_tab.repo_name
+        else:
+            repo_name = "API更新"
         game_path = os.path.join(os.getcwd(), "game", repo_name)
         if not os.path.exists(game_path):
             os.makedirs(game_path)
@@ -412,6 +564,10 @@ class UpdaterUI(QWidget):
                 tab.asset_selector.setVisible(False)
                 QMessageBox.warning(self, "警告", "该版本没有可用的资产文件")
 
+    def get_real_download_url(self, url):
+        # You can modify this method if needed based on your requirements
+        return url
+
     def start_update(self, repo_name, tab):
         """
         开始下载并更新选定的资产文件
@@ -425,6 +581,7 @@ class UpdaterUI(QWidget):
             return
         asset = tab.asset_selector.itemData(selected_asset_index)
         download_url = asset.get("browser_download_url")
+        download_url = self.get_real_download_url(download_url)
         asset_name = asset.get("name")
         if not download_url or not asset_name:
             QMessageBox.warning(self, "警告", "无法获取资产文件的下载链接或文件名")
@@ -468,6 +625,119 @@ class UpdaterUI(QWidget):
         index -- 当前选中的标签页索引。
         """
         self.populate_game_list()
+
+    # 以下是新增的 API 更新相关方法
+    def api_check_for_updates(self, tab):
+        """
+        检查 API 的更新。
+        Keyword arguments:
+        tab -- API 对应的标签页小部件
+        """
+        api_base_url = self.config.get("api_base_url", "")
+        if not api_base_url:
+            QMessageBox.critical(self, "错误", "API 基础 URL 无效")
+            return
+        tab.check_update_button.setEnabled(False)
+        label = QLabel("正在检查更新...")
+        label.setAlignment(Qt.AlignCenter)
+        tab.layout().addWidget(label)
+        checker_thread = APIUpdateChecker(self.session, api_base_url)
+        checker_thread.releases_fetched.connect(lambda releases: self.api_show_releases(releases, tab))
+        checker_thread.error_occurred.connect(self.show_error_message)
+        checker_thread.start()
+        tab.checker_thread = checker_thread
+
+    def api_show_releases(self, releases, tab):
+        """
+        显示 API 的发布版本信息
+        Keyword arguments:
+        releases -- 发布版本的列表
+        tab -- API 对应的标签页小部件
+        """
+        tab.check_update_button.setEnabled(True)
+        if not releases:
+            QMessageBox.warning(self, "警告", "未找到任何发布版本")
+            return
+        tab.version_selector.clear()
+        for release in releases:
+            version_name = release.get("versionName")
+            tab.version_selector.addItem(version_name, release)
+        tab.version_selector.setVisible(True)
+        tab.release_notes.setVisible(True)
+        tab.download_button.setVisible(True)
+        tab.version_selector.currentIndexChanged.connect(lambda index: self.api_display_release_details(index, tab))
+        for i in reversed(range(tab.layout().count())):
+            widget = tab.layout().itemAt(i).widget()
+            if isinstance(widget, QLabel) and widget.text() == "正在检查更新...":
+                tab.layout().removeWidget(widget)
+                widget.deleteLater()
+        tab.download_button.clicked.connect(lambda: self.api_start_update(tab))
+        self.api_display_release_details(0, tab)
+
+    def api_display_release_details(self, index, tab):
+        """
+        显示选定版本的发布说明和资产列表
+        Keyword arguments:
+        index -- 版本选择器中选定的索引
+        tab -- API 对应的标签页小部件
+        """
+        release = tab.version_selector.itemData(index)
+        if release:
+            release_info = f"版本: {release.get('versionName')}\n作者: {release.get('author')}\n提交: {release.get('commit')}\n创建时间: {release.get('createTime')}"
+            tab.release_notes.setText(release_info)
+            tab.selected_release = release
+            assets = release.get("releaseFile", [])
+            tab.asset_selector.clear()
+            if assets:
+                for asset in assets:
+                    platform = asset.get('platform')
+                    size = asset.get('size')
+                    asset_name = f"{platform} ({size})"
+                    tab.asset_selector.addItem(asset_name, asset)
+                tab.asset_selector.setVisible(True)
+            else:
+                tab.asset_selector.setVisible(False)
+                QMessageBox.warning(self, "警告", "该版本没有可用的资产文件")
+
+    def api_start_update(self, tab):
+        """
+        开始下载并更新选定的资产文件
+        Keyword arguments:
+        tab -- API 对应的标签页小部件
+        """
+        selected_asset_index = tab.asset_selector.currentIndex()
+        if selected_asset_index == -1:
+            QMessageBox.warning(self, "警告", "请先选择要下载的资产文件")
+            return
+        asset = tab.asset_selector.itemData(selected_asset_index)
+        download_url = asset.get("downloadUrl")
+        asset_name = download_url.split('/')[-1]  # 从 URL 中获取文件名
+        if not download_url or not asset_name:
+            QMessageBox.warning(self, "警告", "无法获取资产文件的下载链接或文件名")
+            return
+        tab.progress_bar.setVisible(True)
+        game_path = os.path.join(os.getcwd(), "game", "API更新")
+        updater_thread = APIUpdater(self.session, download_url, game_path, asset_name)
+        updater_thread.progress.connect(tab.progress_bar.setValue)
+        updater_thread.finished.connect(lambda success: self.api_update_finished(success, tab))
+        updater_thread.error_occurred.connect(self.show_error_message)
+        updater_thread.start()
+        tab.updater_thread = updater_thread
+
+    def api_update_finished(self, success, tab):
+        """
+        API 更新完成后的处理函数
+        Keyword arguments:
+        success -- 布尔值，表示更新是否成功
+        tab -- API 对应的标签页小部件
+        """
+        tab.check_update_button.setEnabled(True)
+        if success:
+            QMessageBox.information(self, "更新完成", "应用程序已成功更新")
+            self.populate_game_list()
+        else:
+            QMessageBox.critical(self, "更新失败", "更新应用程序时发生错误")
+        tab.progress_bar.setVisible(False)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

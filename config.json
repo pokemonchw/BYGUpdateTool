@@ -2,10 +2,10 @@
   "github_api_token": "",
   "repositories": [
         {
-          "name": "dieloli",
-          "repo": "pokemonchw/dieloli",
-          "asset_name": "dieloli_windows_test.zip"
+          "name": "erArk",
+          "repo": "Godofcong-1/erArk"
         }
-    ]
+    ],
+    "api_base_url": "https://dieloli.org"
 }
 
